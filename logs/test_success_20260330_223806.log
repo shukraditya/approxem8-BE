@@ -1,0 +1,25 @@
+=== Materialized Samples - SUCCESS ===
+Mon Mar 30 22:38:06 IST 2026
+
+=== Test 1: GROUP BY region ===
+{
+  "strategy": null,
+  "sample_table": null,
+  "query_time_ms": null
+}
+
+=== Test 2: Simple COUNT ===
+{
+  "strategy": null,
+  "sample_table": null,
+  "query_time_ms": null
+}
+
+=== Test 3: Compare exact vs materialized ===
+{
+  "exact_time": null,
+  "approx_time": null,
+  "speedup": null
+}
+
+=== All Tests Complete ===

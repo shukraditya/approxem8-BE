@@ -56,6 +56,32 @@ class AutoRouter:
 
         # Routing rules
 
+        # 0. Check for materialized samples first (fastest path)
+        if has_group_by:
+            group_col = self._extract_group_by_column(parsed)
+
+            # If stratified sample available for GROUP BY region
+            if (group_col.lower() == 'region' and
+                self.profiler.has_materialized_sample(table, 'stratified')):
+                return {
+                    "strategy": "materialized",
+                    "config": {
+                        "sample_table": f"{table}_sample_stratified",
+                        "sample_type": "stratified"
+                    },
+                }
+
+        # Check for uniform sample on simple aggregates
+        if self.profiler.has_materialized_sample(table, '10pct'):
+            if not has_group_by and not has_distinct_count and not has_quantile:
+                return {
+                    "strategy": "materialized",
+                    "config": {
+                        "sample_table": f"{table}_sample_10pct",
+                        "sample_type": "10pct"
+                    },
+                }
+
         # 1. Quantile queries → t-Digest
         if has_quantile:
             return {
@@ -188,8 +214,10 @@ class AutoRouter:
         if group:
             # Get the SQL representation and extract first column
             group_sql = group.sql()
-            # Remove "GROUP BY" prefix and get first column
-            parts = group_sql.replace("group by", "").strip().split(",")
+            # Remove "GROUP BY" prefix (case-insensitive) and get first column
+            import re
+            group_sql_clean = re.sub(r'GROUP\s+BY\s*', '', group_sql, flags=re.IGNORECASE)
+            parts = group_sql_clean.strip().split(",")
             if parts:
                 return parts[0].strip()
         return ""

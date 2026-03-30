@@ -1,0 +1,44 @@
+=== Materialized Samples Test Suite (Fixed) ===
+Date: Mon Mar 30 22:28:03 IST 2026
+
+=== Test 1: GROUP BY region (materialized stratified) ===
+{
+  "results": [
+    {
+      "region": "Antarctica",
+      "cnt": 100517
+    },
+    {
+      "region": "US",
+      "cnt": 45042961
+    },
+    {
+      "region": "UK",
+      "cnt": 4905546
+    }
+  ],
+  "metadata": {
+    "mode": "approx",
+    "query_time_ms": 1177.91,
+    "rows_returned": 3,
+    "sample_rate": 0.1,
+    "strategy": "duckdb_sample",
+    "error_estimate": {
+      "cnt": {
+        "estimated_total": 49055460,
+        "error_pct": 0.03,
+        "ci_low": 49043105,
+        "ci_high": 49067814,
+        "confidence": 0.95
+      }
+    },
+    "accuracy_requested": 0.95,
+    "accuracy_achieved": 0.95
+  }
+}
+
+=== Test 2: Simple COUNT (materialized uniform) ===
+
+=== Test 3: Compare exact vs materialized ===
+
+=== Tests Complete ===
