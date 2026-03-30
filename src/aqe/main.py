@@ -1,0 +1,297 @@
+"""FastAPI application for Approximate Query Engine."""
+import time
+from contextlib import asynccontextmanager
+
+import duckdb
+from fastapi import FastAPI
+
+from aqe.models import QueryRequest, QueryResponse, QueryMetadata
+from aqe.error import estimate_count_error, estimate_sum_error, estimate_avg_error
+from aqe.strategies.python_hll import PythonHLLStrategy
+from aqe.strategies.tdigest import TDigestStrategy
+from aqe.strategies.stratified import StratifiedSamplingStrategy
+
+# Global DuckDB connection
+_db = None
+
+
+def get_db():
+    """Get or create DuckDB connection with sales data loaded."""
+    global _db
+    if _db is None:
+        _db = duckdb.connect()
+        _db.execute("CREATE VIEW sales AS SELECT * FROM 'data/sales.parquet'")
+    return _db
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage database connection lifecycle."""
+    get_db()  # Initialize on startup
+    yield
+    global _db
+    if _db:
+        _db.close()
+        _db = None
+
+
+app = FastAPI(title="Approximate Query Engine", lifespan=lifespan)
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return {"status": "ok", "data_loaded": _db is not None}
+
+
+@app.post("/query", response_model=QueryResponse)
+async def query(req: QueryRequest):
+    """Execute SQL query (exact or approximate)."""
+    db = get_db()
+
+    start = time.perf_counter()
+
+    if req.mode == "exact":
+        result = db.execute(req.sql).fetchdf()
+        records = result.to_dict("records")
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        return QueryResponse(
+            results=records,
+            metadata=QueryMetadata(
+                mode=req.mode,
+                query_time_ms=round(elapsed_ms, 2),
+                rows_returned=len(records),
+            ),
+        )
+
+    # Approximate mode - choose strategy
+    strategy = req.strategy or "duckdb_sample"
+
+    if strategy == "python_hll":
+        hll = PythonHLLStrategy()
+        if not hll.supports(req.sql):
+            return {"error": "python_hll strategy requires COUNT(DISTINCT column)"}
+
+        config = req.config or {}
+        config.setdefault("sample_rate", req.sample_rate)
+        result = hll.execute(req.sql, config)
+
+        return QueryResponse(
+            results=result["results"],
+            metadata=QueryMetadata(
+                mode=req.mode,
+                strategy=strategy,
+                query_time_ms=result["metadata"]["query_time_ms"],
+                rows_returned=len(result["results"]),
+                sample_rate=result["metadata"].get("sample_rate"),
+                error_estimate={"approx_count_distinct": result["metadata"]["estimated_error_pct"]},
+            ),
+        )
+
+    elif strategy == "tdigest":
+        td = TDigestStrategy()
+        if not td.supports(req.sql):
+            return {"error": "tdigest strategy requires percentile/median query"}
+
+        config = req.config or {}
+        config.setdefault("sample_rate", req.sample_rate)
+        result = td.execute(req.sql, config)
+
+        return QueryResponse(
+            results=result["results"],
+            metadata=QueryMetadata(
+                mode=req.mode,
+                strategy=strategy,
+                query_time_ms=result["metadata"]["query_time_ms"],
+                rows_returned=len(result["results"]),
+                sample_rate=result["metadata"].get("sample_rate"),
+                error_estimate={"quantiles": result["metadata"]["estimated_error_pct"]},
+            ),
+        )
+
+    elif strategy == "stratified":
+        ss = StratifiedSamplingStrategy()
+        if not ss.supports(req.sql):
+            return {"error": "stratified strategy requires GROUP BY query"}
+
+        config = req.config or {}
+        config.setdefault("sample_rate", req.sample_rate)
+        result = ss.execute(req.sql, config)
+
+        return QueryResponse(
+            results=result["results"],
+            metadata=QueryMetadata(
+                mode=req.mode,
+                strategy=strategy,
+                query_time_ms=result["metadata"]["query_time_ms"],
+                rows_returned=len(result["results"]),
+                sample_rate=result["metadata"].get("sample_rate"),
+                error_estimate={"per_group": result["metadata"].get("groups")},
+            ),
+        )
+
+    else:
+        # Default: duckdb_sample
+        sql = add_sample_clause(req.sql, req.sample_rate)
+        result = db.execute(sql).fetchdf()
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        records = result.to_dict("records")
+
+        # Calculate error estimates for COUNT columns
+        error_estimate = calculate_sampling_errors(db, req.sql, req.sample_rate, records)
+
+        return QueryResponse(
+            results=records,
+            metadata=QueryMetadata(
+                mode=req.mode,
+                strategy="duckdb_sample",
+                query_time_ms=round(elapsed_ms, 2),
+                rows_returned=len(records),
+                sample_rate=req.sample_rate,
+                error_estimate=error_estimate,
+            ),
+        )
+
+
+def calculate_sampling_errors(db, sql: str, sample_rate: float, records: list) -> dict:
+    """Calculate error estimates for sampled query results."""
+    import re
+
+    errors = {}
+
+    # Get population size
+    table_match = re.search(r"FROM\s+(\w+)", sql, re.IGNORECASE)
+    if not table_match:
+        return errors
+
+    table = table_match.group(1)
+    pop_result = db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+    population_size = pop_result[0]
+
+    # Find COUNT(*) columns and estimate errors
+    count_matches = re.findall(r"COUNT\s*\(\s*\*\s*\)(?:\s+AS\s+(\w+))?", sql, re.IGNORECASE)
+    for i, alias in enumerate(count_matches):
+        alias = alias or f"count_{i}"
+        for record in records:
+            # Find the count column in record
+            for key, value in record.items():
+                if isinstance(value, int) and value > 0:
+                    # This is likely a count column
+                    error = estimate_count_error(value, sample_rate)
+                    errors[key] = error
+                    break
+
+    return errors
+
+
+def add_sample_clause(sql: str, sample_rate: float) -> str:
+    """Add USING SAMPLE clause to SELECT query using subquery approach.
+
+    DuckDB requires USING SAMPLE in a subquery when using GROUP BY, ORDER BY, etc.
+    """
+    import re
+
+    sample_percent = int(sample_rate * 100)
+
+    # Pattern to match FROM table_name followed by space or keyword
+    reserved = ['WHERE', 'GROUP', 'ORDER', 'LIMIT', 'UNION', 'JOIN', 'HAVING', 'ON']
+    reserved_pattern = '|'.join(reserved)
+
+    pattern = rf"FROM\s+(\w+)\b(?:\s+(?!{reserved_pattern}\b)(\w+))?"
+    match = re.search(pattern, sql, flags=re.IGNORECASE)
+
+    if not match:
+        return sql
+
+    table_name = match.group(1)
+    alias = match.group(2)
+    alias = alias or table_name
+
+    replacement = rf"FROM (SELECT * FROM {table_name} USING SAMPLE {sample_percent}%) AS {alias}"
+
+    return sql[:match.start()] + replacement + sql[match.end():]
+
+
+@app.post("/compare")
+async def compare(req: QueryRequest):
+    """Run exact and approximate queries, compare results."""
+    # Run exact
+    exact_req = QueryRequest(sql=req.sql, mode="exact")
+    exact_result = await query(exact_req)
+
+    # Run approx
+    approx_req = QueryRequest(
+        sql=req.sql, mode="approx", sample_rate=req.sample_rate, strategy=req.strategy
+    )
+    approx_result = await query(approx_req)
+
+    # Calculate speedup
+    speedup = exact_result.metadata.query_time_ms / approx_result.metadata.query_time_ms
+
+    return {
+        "exact": {
+            "time_ms": exact_result.metadata.query_time_ms,
+            "results": exact_result.results,
+        },
+        "approx": {
+            "time_ms": approx_result.metadata.query_time_ms,
+            "strategy": approx_result.metadata.strategy,
+            "sample_rate": approx_result.metadata.sample_rate,
+            "results": approx_result.results,
+            "error_estimate": approx_result.metadata.error_estimate,
+        },
+        "speedup": round(speedup, 2),
+    }
+
+
+@app.post("/compare-strategies")
+async def compare_strategies(req: QueryRequest):
+    """Compare all available strategies for a query."""
+    strategies = []
+
+    # Test each strategy
+    for strategy_name in ["duckdb_sample", "stratified", "python_hll", "tdigest"]:
+        try:
+            test_req = QueryRequest(
+                sql=req.sql,
+                mode="approx",
+                sample_rate=req.sample_rate,
+                strategy=strategy_name,
+            )
+            result = await query(test_req)
+
+            if hasattr(result, 'metadata'):
+                strategies.append({
+                    "name": strategy_name,
+                    "supported": True,
+                    "time_ms": result.metadata.query_time_ms,
+                    "error_estimate": result.metadata.error_estimate,
+                    "results": result.results,
+                })
+            else:
+                # Strategy returned an error dict
+                strategies.append({
+                    "name": strategy_name,
+                    "supported": False,
+                    "error": result.get("error", "Unknown error"),
+                })
+        except Exception as e:
+            strategies.append({
+                "name": strategy_name,
+                "supported": False,
+                "error": str(e),
+            })
+
+    # Also run exact for comparison
+    exact_req = QueryRequest(sql=req.sql, mode="exact")
+    exact_result = await query(exact_req)
+
+    return {
+        "exact": {
+            "time_ms": exact_result.metadata.query_time_ms,
+            "results": exact_result.results,
+        },
+        "strategies": strategies,
+    }

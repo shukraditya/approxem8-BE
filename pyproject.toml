@@ -1,0 +1,23 @@
+[project]
+name = "aqe"
+version = "0.1.0"
+description = "Approximate Query Engine"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasketch>=1.9.0",
+    "duckdb>=1.5.1",
+    "fastapi>=0.135.2",
+    "numpy>=2.4.4",
+    "pandas>=3.0.1",
+    "pydantic>=2.12.5",
+    "sqlparse>=0.5.5",
+    "tdigest>=0.5.2.2",
+    "uvicorn>=0.42.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aqe"]
+
+[tool.uv]
+package = true
