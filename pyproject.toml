@@ -11,6 +11,7 @@ dependencies = [
     "numpy>=2.4.4",
     "pandas>=3.0.1",
     "pydantic>=2.12.5",
+    "sqlglot>=25.0.0",
     "sqlparse>=0.5.5",
     "tdigest>=0.5.2.2",
     "uvicorn>=0.42.0",

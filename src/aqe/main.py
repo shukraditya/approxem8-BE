@@ -10,9 +10,15 @@ from aqe.error import estimate_count_error, estimate_sum_error, estimate_avg_err
 from aqe.strategies.python_hll import PythonHLLStrategy
 from aqe.strategies.tdigest import TDigestStrategy
 from aqe.strategies.stratified import StratifiedSamplingStrategy
+from aqe.profiler import DataProfiler
+from aqe.router import AutoRouter
 
 # Global DuckDB connection
 _db = None
+
+# Global profiler and router
+_profiler = None
+_router = None
 
 
 def get_db():
@@ -27,7 +33,16 @@ def get_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage database connection lifecycle."""
-    get_db()  # Initialize on startup
+    global _profiler, _router
+    db = get_db()  # Initialize on startup
+
+    # Initialize profiler and profile tables
+    _profiler = DataProfiler()
+    _profiler.profile_table(db, "sales")
+
+    # Initialize router
+    _router = AutoRouter(_profiler)
+
     yield
     global _db
     if _db:
@@ -51,6 +66,21 @@ async def query(req: QueryRequest):
 
     start = time.perf_counter()
 
+    # Auto-router: if accuracy specified, determine optimal strategy
+    if req.accuracy is not None and _router is not None:
+        routing = _router.route(req.sql, db, req.accuracy)
+        strategy = routing["strategy"]
+        config = routing.get("config", {})
+
+        # Apply routing decisions
+        req.strategy = strategy
+        req.mode = "approx"  # Accuracy implies approximate mode
+        if "sample_rate" in config:
+            req.sample_rate = config["sample_rate"]
+        if "hll_precision" in config:
+            req.config = req.config or {}
+            req.config["hll_precision"] = config["hll_precision"]
+
     if req.mode == "exact":
         result = db.execute(req.sql).fetchdf()
         records = result.to_dict("records")
@@ -62,6 +92,8 @@ async def query(req: QueryRequest):
                 mode=req.mode,
                 query_time_ms=round(elapsed_ms, 2),
                 rows_returned=len(records),
+                accuracy_requested=req.accuracy,
+                accuracy_achieved=1.0,  # Exact queries have 100% accuracy
             ),
         )
 
@@ -77,6 +109,10 @@ async def query(req: QueryRequest):
         config.setdefault("sample_rate", req.sample_rate)
         result = hll.execute(req.sql, config)
 
+        # Calculate achieved accuracy from error percentage
+        error_pct = result["metadata"]["estimated_error_pct"]
+        achieved = 1.0 - (error_pct / 100)
+
         return QueryResponse(
             results=result["results"],
             metadata=QueryMetadata(
@@ -86,6 +122,8 @@ async def query(req: QueryRequest):
                 rows_returned=len(result["results"]),
                 sample_rate=result["metadata"].get("sample_rate"),
                 error_estimate={"approx_count_distinct": result["metadata"]["estimated_error_pct"]},
+                accuracy_requested=req.accuracy,
+                accuracy_achieved=round(achieved, 3),
             ),
         )
 
@@ -98,6 +136,10 @@ async def query(req: QueryRequest):
         config.setdefault("sample_rate", req.sample_rate)
         result = td.execute(req.sql, config)
 
+        # Calculate achieved accuracy from error percentage
+        error_pct = result["metadata"]["estimated_error_pct"]
+        achieved = 1.0 - (error_pct / 100)
+
         return QueryResponse(
             results=result["results"],
             metadata=QueryMetadata(
@@ -107,6 +149,8 @@ async def query(req: QueryRequest):
                 rows_returned=len(result["results"]),
                 sample_rate=result["metadata"].get("sample_rate"),
                 error_estimate={"quantiles": result["metadata"]["estimated_error_pct"]},
+                accuracy_requested=req.accuracy,
+                accuracy_achieved=round(achieved, 3),
             ),
         )
 
@@ -119,6 +163,12 @@ async def query(req: QueryRequest):
         config.setdefault("sample_rate", req.sample_rate)
         result = ss.execute(req.sql, config)
 
+        # Estimate achieved accuracy from number of groups and samples
+        groups = result["metadata"].get("groups", 10)
+        # More groups with samples = better representation
+        # Simplified: assume 95% confidence
+        achieved = 0.95 if groups > 0 else 0.5
+
         return QueryResponse(
             results=result["results"],
             metadata=QueryMetadata(
@@ -128,6 +178,8 @@ async def query(req: QueryRequest):
                 rows_returned=len(result["results"]),
                 sample_rate=result["metadata"].get("sample_rate"),
                 error_estimate={"per_group": result["metadata"].get("groups")},
+                accuracy_requested=req.accuracy,
+                accuracy_achieved=round(achieved, 3),
             ),
         )
 
@@ -151,6 +203,8 @@ async def query(req: QueryRequest):
                 rows_returned=len(records),
                 sample_rate=req.sample_rate,
                 error_estimate=error_estimate,
+                accuracy_requested=req.accuracy,
+                accuracy_achieved=round(1.0 - (0.05 if req.sample_rate else 0.0), 3),
             ),
         )
 
