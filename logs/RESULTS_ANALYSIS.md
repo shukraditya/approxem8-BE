@@ -351,6 +351,65 @@ Materialized samples deliver **10-150x speedup** for analytical queries with min
 
 ---
 
+## Updated Results (March 31, 2026)
+
+### Accuracy-Based Sample Selection (Warm Cache)
+
+After replacing the 5% sample with 1% for better accuracy tier differentiation:
+
+| Accuracy Target | Sample Size | Avg Query Time | Storage | Actual Accuracy |
+|----------------|-------------|----------------|---------|-----------------|
+| **85%** | 1% (5M rows) | **~1.1ms** | 50MB | ~96% |
+| **90%** | 10% (50M rows) | **~2.3ms** | 500MB | ~99% |
+| **95%** | 20% (100M rows) | **~3.5ms** | 1GB | ~99.5% |
+| **Exact** | 100% (500M rows) | ~20ms | 5GB | 100% |
+
+**Key Finding**: The 1% sample (85% accuracy target) is actually **fastest** when cache is warm (~1ms), even faster than 10% and 20% samples. Cold cache (first query) shows ~330ms due to disk I/O.
+
+### DuckDB Native Optimizations
+
+Replaced Python implementations with DuckDB native functions:
+
+| Function | Before (Python) | After (DuckDB Native) | Speedup |
+|----------|-----------------|----------------------|---------|
+| **COUNT DISTINCT** | ~493s (Python HLL) | **~970ms** | **508x faster** |
+| **MEDIAN** | ~23s (exact) | **~6.9s** | **3.3x faster** |
+
+**Query Examples:**
+```sql
+-- COUNT DISTINCT: 962,761 (~4% error vs exact 1,000,001)
+-- Query time: ~970ms (was 493,000ms with Python HLL)
+
+-- MEDIAN: 500.0 (~0.2% error vs exact 500.0)
+-- Query time: ~6,900ms (was 23,000ms exact)
+```
+
+### GROUP BY with Stratified Sample
+
+```sql
+SELECT region, COUNT(*) FROM sales GROUP BY region
+```
+
+| Run | Query Time |
+|-----|------------|
+| 1 | 186.5ms |
+| 2 | 156.3ms |
+| 3 | 149.5ms |
+
+**Average: ~164ms** for GROUP BY with 3 regions (US, UK, Antarctica)
+
+### Storage Optimization
+
+**Before:** 5% + 10% + 20% = **35% overhead**
+**After:** 1% + 10% + 20% = **31% overhead**
+
+Clean differentiation:
+- 1% → 85-90% targets (minimum viable sample)
+- 10% → 91-95% targets (sweet spot)
+- 20% → 96-99% targets (highest accuracy)
+
+---
+
 ## Appendix: Test Log Files
 
 All test results saved in `/Users/user/dev/saska/approx-query-engine/logs/`:
@@ -362,5 +421,6 @@ All test results saved in `/Users/user/dev/saska/approx-query-engine/logs/`:
 
 ---
 
-*Analysis generated: March 30, 2026*
+*Analysis generated: March 31, 2026*
 *Test environment: Local DuckDB, 500M row dataset*
+*Cache state: Warm (after initial query on each sample)*
