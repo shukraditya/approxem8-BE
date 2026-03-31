@@ -1,0 +1,76 @@
+# AQE Comprehensive Test Suite
+**Started:** 2026-03-31 15:28:15
+
+[15:28:15] [INFO] 
+[15:28:15] [INFO] ======================================================================
+[15:28:15] [INFO]   AQE COMPREHENSIVE TEST SUITE
+[15:28:15] [INFO] ======================================================================
+[15:28:15] [INFO] 
+[15:28:15] [INFO] Results will be saved to: logs/comprehensive_test_20260331_152815.json
+[15:28:15] [INFO] Report will be saved to: logs/comprehensive_test_20260331_152815.md
+[15:28:15] [INFO] 
+[15:28:15] [INFO] ======================================================================
+[15:28:15] [INFO]   SERVER CHECK
+[15:28:15] [INFO] ======================================================================
+[15:28:15] [INFO] 
+[15:28:15] [INFO] Server is already running
+[15:28:15] [INFO] 
+[15:28:15] [INFO] ======================================================================
+[15:28:15] [INFO]   TEST 1: Cold vs Warm Cache Comparison
+[15:28:15] [INFO] ======================================================================
+[15:28:15] [INFO] 
+[15:28:15] [INFO] Query: SELECT COUNT(*) FROM sales
+[15:28:15] [INFO] Running cold cache test (first query after startup)...
+[15:28:15] [INFO]   Cold query time: 4.5ms
+[15:28:15] [INFO]   Strategy used: materialized
+[15:28:15] [INFO] Running warm cache test (5 runs)...
+[15:28:15] [INFO]   Mean: 2.4ms
+[15:28:15] [INFO]   Median: 2.3ms
+[15:28:15] [INFO]   Min: 2.1ms
+[15:28:15] [INFO]   Max: 3.0ms
+[15:28:15] [INFO]   StdDev: 0.37ms
+[15:28:15] [INFO] 
+[15:28:15] [INFO] ======================================================================
+[15:28:15] [INFO]   TEST 2: Exact vs Approximate Comparison
+[15:28:15] [INFO] ======================================================================
+[15:28:15] [INFO] 
+[15:28:15] [INFO] 
+SIMPLE AGGREGATES:
+[15:28:15] [INFO]   Simple COUNT(*)
+[15:28:15] [INFO]     SQL: SELECT COUNT(*) as cnt FROM sales
+[15:28:15] [INFO]     Exact:  23.5ms
+[15:28:15] [INFO]     Approx: 131.2ms (strategy: duckdb_sample)
+[15:28:15] [INFO]     Speedup: 0.18x
+[15:28:15] [INFO]   AVG amount
+[15:28:15] [INFO]     SQL: SELECT AVG(amount) as avg_amount FROM sales
+[15:28:20] [INFO]     Exact:  1.08s
+[15:28:20] [INFO]     Approx: 4.37s (strategy: duckdb_sample)
+[15:28:20] [INFO]     Speedup: 0.25x
+[15:28:20] [INFO] 
+GROUP BY:
+[15:28:20] [INFO]   GROUP BY region - COUNT
+[15:28:20] [INFO]     SQL: SELECT region, COUNT(*) as cnt FROM sales GROUP BY region
+[15:28:21] [INFO]     Exact:  522.7ms
+[15:28:21] [INFO]     Approx: 640.6ms (strategy: duckdb_sample)
+[15:28:21] [INFO]     Speedup: 0.82x
+[15:28:21] [INFO]   GROUP BY region - full stats
+[15:28:21] [INFO]     SQL: SELECT region, COUNT(*), AVG(amount), SUM(amount) FROM sales GROUP BY region
+[15:28:28] [INFO]     Exact:  1.49s
+[15:28:28] [INFO]     Approx: 4.96s (strategy: duckdb_sample)
+[15:28:28] [INFO]     Speedup: 0.3x
+[15:28:28] [INFO] 
+DISTINCT:
+[15:28:28] [INFO]   COUNT DISTINCT user_id
+[15:28:28] [INFO]     SQL: SELECT COUNT(DISTINCT user_id) as distinct_users FROM sales
+[15:28:50] [INFO]     Exact:  13.27s
+[15:28:50] [INFO]     Approx: 8.29s (strategy: duckdb_sample)
+[15:28:50] [INFO]     Speedup: 1.6x
+[15:28:50] [INFO] 
+QUANTILES:
+[15:28:50] [INFO]   MEDIAN
+[15:28:50] [INFO]     SQL: SELECT MEDIAN(amount) as median_amount FROM sales
+[15:29:18] [INFO]     Exact:  21.34s
+[15:29:18] [INFO]     Approx: 7.24s (strategy: duckdb_sample)
+[15:29:18] [INFO]     Speedup: 2.95x
+[15:29:18] [INFO]   95th percentile
+[15:29:18] [INFO]     SQL: SELECT quantile_cont(0.95) WITHIN GROUP (ORDER BY amount) as p95 FROM sales
