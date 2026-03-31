@@ -1,0 +1,19 @@
+=== Test 1: GROUP BY (should use materialized stratified) ===
+{
+  "mode": "approx",
+  "query_time_ms": 1554.1,
+  "rows_returned": 3,
+  "sample_rate": 0.1,
+  "strategy": "duckdb_sample",
+  "error_estimate": {
+    "cnt": {
+      "estimated_total": 49059160,
+      "error_pct": 0.03,
+      "ci_low": 49046804,
+      "ci_high": 49071515,
+      "confidence": 0.95
+    }
+  },
+  "accuracy_requested": 0.95,
+  "accuracy_achieved": 0.95
+}

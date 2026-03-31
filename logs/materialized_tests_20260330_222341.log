@@ -1,0 +1,32 @@
+=== Materialized Samples Test Suite ===
+Date: Mon Mar 30 22:23:41 IST 2026
+
+=== Test 1: GROUP BY region (materialized stratified) ===
+{
+  "mode": "approx",
+  "query_time_ms": 1162.76,
+  "rows_returned": 3,
+  "sample_rate": 0.1,
+  "strategy": "duckdb_sample",
+  "error_estimate": {
+    "cnt": {
+      "estimated_total": 49104600,
+      "error_pct": 0.03,
+      "ci_low": 49092238,
+      "ci_high": 49116961,
+      "confidence": 0.95
+    }
+  },
+  "accuracy_requested": 0.95,
+  "accuracy_achieved": 0.95
+}
+
+=== Test 2: Simple COUNT (materialized uniform) ===
+jq: parse error: Invalid numeric literal at line 1, column 9
+
+=== Test 3: COUNT DISTINCT (python_hll, not materialized) ===
+
+=== Test 4: AVG (materialized uniform) ===
+jq: parse error: Invalid numeric literal at line 1, column 9
+
+=== Tests Complete ===

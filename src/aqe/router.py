@@ -56,19 +56,68 @@ class AutoRouter:
 
         # Routing rules
 
-        # 1. Quantile queries → t-Digest
+        # 0. Check for materialized samples first (fastest path)
+        if has_group_by:
+            group_col = self._extract_group_by_column(parsed)
+
+            # If stratified sample available for GROUP BY region
+            if (group_col.lower() == 'region' and
+                self.profiler.has_materialized_sample(table, 'stratified')):
+                return {
+                    "strategy": "materialized",
+                    "config": {
+                        "sample_table": f"{table}_sample_stratified",
+                        "sample_type": "stratified"
+                    },
+                }
+
+        # Check for uniform sample on simple aggregates (accuracy-based selection)
+        if not has_group_by and not has_distinct_count and not has_quantile:
+            # Select sample based on accuracy target
+            if accuracy >= 0.95 and self.profiler.has_materialized_sample(table, '20pct'):
+                return {
+                    "strategy": "materialized",
+                    "config": {
+                        "sample_table": f"{table}_sample_20pct",
+                        "sample_type": "20pct"
+                    },
+                }
+            elif accuracy >= 0.90 and self.profiler.has_materialized_sample(table, '10pct'):
+                return {
+                    "strategy": "materialized",
+                    "config": {
+                        "sample_table": f"{table}_sample_10pct",
+                        "sample_type": "10pct"
+                    },
+                }
+            elif self.profiler.has_materialized_sample(table, '1pct'):
+                return {
+                    "strategy": "materialized",
+                    "config": {
+                        "sample_table": f"{table}_sample_1pct",
+                        "sample_type": "1pct"
+                    },
+                }
+                return {
+                    "strategy": "materialized",
+                    "config": {
+                        "sample_table": f"{table}_sample_5pct",
+                        "sample_type": "5pct"
+                    },
+                }
+
+        # 1. Quantile queries → DuckDB native APPROX_QUANTILE
         if has_quantile:
             return {
-                "strategy": "tdigest",
-                "config": {"sample_rate": 1.0},  # No sampling needed for t-Digest
+                "strategy": "duckdb_quantile",
+                "config": {},
             }
 
-        # 2. COUNT DISTINCT → HyperLogLog
+        # 2. COUNT DISTINCT → DuckDB native APPROX_COUNT_DISTINCT
         elif has_distinct_count:
-            precision = accuracy_to_hll_precision(accuracy)
             return {
-                "strategy": "python_hll",
-                "config": {"hll_precision": precision},
+                "strategy": "duckdb_approx",
+                "config": {},
             }
 
         # 3. GROUP BY → check if skewed
@@ -188,8 +237,10 @@ class AutoRouter:
         if group:
             # Get the SQL representation and extract first column
             group_sql = group.sql()
-            # Remove "GROUP BY" prefix and get first column
-            parts = group_sql.replace("group by", "").strip().split(",")
+            # Remove "GROUP BY" prefix (case-insensitive) and get first column
+            import re
+            group_sql_clean = re.sub(r'GROUP\s+BY\s*', '', group_sql, flags=re.IGNORECASE)
+            parts = group_sql_clean.strip().split(",")
             if parts:
                 return parts[0].strip()
         return ""

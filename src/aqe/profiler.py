@@ -7,10 +7,12 @@ class DataProfiler:
     """Profiles tables to enable intelligent strategy selection.
 
     Caches profiling results to avoid re-computation.
+    Tracks materialized sample tables for fast querying.
     """
 
     def __init__(self):
         self.cache: Dict[str, Dict[str, Any]] = {}
+        self.materialized_samples: Dict[str, list] = {}
 
     def profile_table(self, db, table_name: str) -> Dict[str, Any]:
         """Profile a table: row count, column stats, skew.
@@ -126,3 +128,95 @@ class DataProfiler:
         gini = numerator / (n * total) - (n + 1) / n
 
         return abs(gini)  # 0 to 1
+
+    def create_materialized_samples(self, db, table_name: str):
+        """Create materialized sample tables at startup.
+
+        Creates:
+        - {table}_sample_10pct: 10% uniform sample
+        - {table}_sample_stratified: 10% per-region stratified sample
+
+        Args:
+            db: DuckDB connection
+            table_name: Name of source table to sample from
+        """
+        # Check if samples already exist
+        try:
+            existing = db.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_name LIKE 'sales_sample_%'
+            """).fetchall()
+
+            if existing:
+                # Track existing samples
+                self.materialized_samples[table_name] = [
+                    row[0].replace(f"{table_name}_sample_", "")
+                    for row in existing
+                ]
+                return  # Samples already created
+        except Exception:
+            pass  # Table may not exist yet
+
+        print(f"Creating materialized samples for {table_name}...")
+
+        # Create uniform samples at different rates for accuracy tiers
+        sample_configs = [
+            ('1pct', 1),    # ~85-90% accuracy (minimum viable)
+            ('10pct', 10),  # ~91-95% accuracy
+            ('20pct', 20),  # ~96-99% accuracy (most accurate)
+        ]
+
+        created_samples = []
+        for sample_name, rate in sample_configs:
+            try:
+                db.execute(f"""
+                    CREATE TABLE {table_name}_sample_{sample_name} AS
+                    SELECT * FROM {table_name} USING SAMPLE {rate}%
+                """)
+                print(f"  - Created {table_name}_sample_{sample_name} ({rate}%)")
+                created_samples.append(sample_name)
+            except Exception as e:
+                print(f"  - Failed to create {sample_name} sample: {e}")
+
+        # Create stratified sample by region (10% per region)
+        try:
+            db.execute(f"""
+                CREATE TABLE {table_name}_sample_stratified AS
+                SELECT * FROM {table_name} WHERE region = 'US' USING SAMPLE 10%
+                UNION ALL
+                SELECT * FROM {table_name} WHERE region = 'UK' USING SAMPLE 10%
+                UNION ALL
+                SELECT * FROM {table_name} WHERE region = 'Antarctica' USING SAMPLE 10%
+            """)
+            print(f"  - Created {table_name}_sample_stratified")
+            created_samples.append('stratified')
+        except Exception as e:
+            print(f"  - Failed to create stratified sample: {e}")
+
+        # Track available samples
+        self.materialized_samples[table_name] = created_samples
+        print(f"Materialized samples created: {created_samples}")
+
+    def has_materialized_sample(self, table_name: str, sample_type: str) -> bool:
+        """Check if materialized sample exists.
+
+        Args:
+            table_name: Name of the table
+            sample_type: Type of sample ('10pct' or 'stratified')
+
+        Returns:
+            True if sample exists
+        """
+        return sample_type in self.materialized_samples.get(table_name, [])
+
+    def get_sample_table_name(self, table_name: str, sample_type: str) -> str:
+        """Get the full table name for a materialized sample.
+
+        Args:
+            table_name: Base table name
+            sample_type: Type of sample
+
+        Returns:
+            Full table name (e.g., "sales_sample_stratified")
+        """
+        return f"{table_name}_sample_{sample_type}"

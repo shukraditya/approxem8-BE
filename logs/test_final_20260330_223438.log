@@ -1,0 +1,9 @@
+=== Final Materialized Samples Test ===
+Mon Mar 30 22:34:38 IST 2026
+
+=== Health Check ===
+{"status":"ok","data_loaded":true}
+
+=== Test 1: GROUP BY region ===
+{"results":[{"region":"UK","cnt":4835552},{"region":"US","cnt":44387553},{"region":"Antarctica","cnt":98879}],"metadata":{"mode":"approx","query_time_ms":1403.77,"rows_returned":3,"sample_rate":0.1,"strategy":"duckdb_sample","error_estimate":{"cnt":{"estimated_total":988790,"error_pct":0.18,"ci_low":987035,"ci_high":990544,"confidence":0.95}},"accuracy_requested":0.95,"accuracy_achieved":0.95}}
+=== Test Complete ===
