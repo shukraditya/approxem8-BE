@@ -159,17 +159,26 @@ class DataProfiler:
 
         print(f"Creating materialized samples for {table_name}...")
 
-        # Create uniform 10% sample
-        try:
-            db.execute(f"""
-                CREATE TABLE {table_name}_sample_10pct AS
-                SELECT * FROM {table_name} USING SAMPLE 10%
-            """)
-            print(f"  - Created {table_name}_sample_10pct")
-        except Exception as e:
-            print(f"  - Failed to create uniform sample: {e}")
+        # Create uniform samples at different rates for accuracy tiers
+        sample_configs = [
+            ('1pct', 1),    # ~85-90% accuracy (minimum viable)
+            ('10pct', 10),  # ~91-95% accuracy
+            ('20pct', 20),  # ~96-99% accuracy (most accurate)
+        ]
 
-        # Create stratified sample by region
+        created_samples = []
+        for sample_name, rate in sample_configs:
+            try:
+                db.execute(f"""
+                    CREATE TABLE {table_name}_sample_{sample_name} AS
+                    SELECT * FROM {table_name} USING SAMPLE {rate}%
+                """)
+                print(f"  - Created {table_name}_sample_{sample_name} ({rate}%)")
+                created_samples.append(sample_name)
+            except Exception as e:
+                print(f"  - Failed to create {sample_name} sample: {e}")
+
+        # Create stratified sample by region (10% per region)
         try:
             db.execute(f"""
                 CREATE TABLE {table_name}_sample_stratified AS
@@ -180,12 +189,13 @@ class DataProfiler:
                 SELECT * FROM {table_name} WHERE region = 'Antarctica' USING SAMPLE 10%
             """)
             print(f"  - Created {table_name}_sample_stratified")
+            created_samples.append('stratified')
         except Exception as e:
             print(f"  - Failed to create stratified sample: {e}")
 
         # Track available samples
-        self.materialized_samples[table_name] = ['10pct', 'stratified']
-        print("Materialized samples created.")
+        self.materialized_samples[table_name] = created_samples
+        print(f"Materialized samples created: {created_samples}")
 
     def has_materialized_sample(self, table_name: str, sample_type: str) -> bool:
         """Check if materialized sample exists.

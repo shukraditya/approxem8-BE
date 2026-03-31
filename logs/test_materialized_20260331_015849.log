@@ -1,0 +1,13 @@
+=== Materialized Samples Test Suite ===
+Date: Tue Mar 31 01:58:49 IST 2026
+
+=== Test 1: GROUP BY region (materialized stratified) ===
+{"results":[{"region":"US","cnt":44695974},{"region":"Antarctica","cnt":100075},{"region":"UK","cnt":4861807}],"metadata":{"mode":"approx","query_time_ms":270.92,"rows_returned":3,"sample_rate":null,"strategy":"materialized","error_estimate":{"materialized":true,"sample_table":"sales_sample_10pct"},"accuracy_requested":0.95,"accuracy_achieved":0.95}}
+
+=== Test 2: Simple COUNT (materialized uniform) ===
+{"results":[{"cnt":49657856}],"metadata":{"mode":"approx","query_time_ms":2.56,"rows_returned":1,"sample_rate":null,"strategy":"materialized","error_estimate":{"materialized":true,"sample_table":"sales_sample_10pct"},"accuracy_requested":0.95,"accuracy_achieved":0.95}}
+
+=== Test 3: COUNT DISTINCT (should NOT use materialized) ===
+{"results":[{"approx_count_distinct":997993}],"metadata":{"mode":"approx","query_time_ms":493582.16,"rows_returned":1,"sample_rate":null,"strategy":"python_hll","error_estimate":{"approx_count_distinct":0.812},"accuracy_requested":0.95,"accuracy_achieved":0.992}}
+
+=== Tests Complete ===

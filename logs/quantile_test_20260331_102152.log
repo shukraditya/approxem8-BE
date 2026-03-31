@@ -1,0 +1,13 @@
+=== Quantile Performance Test ===
+Date: $(date)
+
+Test 1: APPROX_QUANTILE (amount, 0.5)
+Result: 500.00
+Time: 5369.06ms
+
+Test 2: EXACT MEDIAN (amount)
+Result: 500.00
+Time: 18271.20ms
+
+Speedup: 3.4x
+Accuracy: 100.00%

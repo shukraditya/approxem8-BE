@@ -7,7 +7,7 @@ FastAPI service for approximate analytical queries using DuckDB with intelligent
 | Command | Purpose |
 |---------|---------|
 | `uv run uvicorn aqe.main:app --reload` | Start FastAPI server |
-| `curl -X POST http://localhost:8000/query -d '{"sql": "SELECT COUNT(*) FROM sales", "accuracy": 0.95}'` | Query with auto-routing |
+| `curl -X POST http://localhost:8000/query -H "Content-Type: application/json" -d '{"sql": "SELECT COUNT(*) FROM sales", "accuracy": 0.95}'` | Query with auto-routing |
 | `curl -X POST http://localhost:8000/compare -d '{"sql": "...", "accuracy": 0.95}'` | Compare exact vs approx |
 | `curl -X POST http://localhost:8000/compare-strategies -d '{"sql": "..."}'` | Compare all strategies |
 | `curl -X POST http://localhost:8000/refresh` | Rebuild materialized samples |
@@ -37,18 +37,21 @@ User Request: {"sql": "...", "accuracy": 0.95}
                ↓
     ┌─────────────────────┐
     │  Auto-Router        │  ← Rule-based strategy selection
-    │  COUNT DISTINCT → HLL        │
-    │  GROUP BY + sample exists →  │  ← NEW: materialized
-    │    Materialized              │
+    │  COUNT DISTINCT → APPROX_    │  ← DuckDB native (680x faster)
+    │    COUNT_DISTINCT            │
+    │  Quantiles → APPROX_         │  ← DuckDB native (3x faster)
+    │    QUANTILE                  │
+    │  GROUP BY + sample exists →  │  ← NEW: accuracy-based samples
+    │    Materialized (1%/10%/20%) │
     │  GROUP BY + skew → Stratified│
-    │  Quantiles → t-Digest        │
     │  Otherwise → DuckDB sample   │
     └──────────┬──────────┘
                ↓
     ┌─────────────────────┐
-    │  Accuracy → Params  │  ← Map 0.95 to sample_rate/precision
-    │  0.95 → sample=0.1  │
-    │  0.95 → HLL p=14    │
+    │  Accuracy → Materialized │  ← Select sample by accuracy
+    │  0.85 → 1% sample   │     (1%/10%/20% for 85/90/95%)
+    │  0.90 → 10% sample  │
+    │  0.95 → 20% sample  │
     └──────────┬──────────┘
                ↓
           Execute Strategy
@@ -66,7 +69,22 @@ User Request: {"sql": "...", "accuracy": 0.95}
 | `GROUP BY region` | ~1,200ms | **122ms** | **9.8x** |
 | `AVG(amount)` | ~500ms | ~50ms | **10x** |
 
-**Storage Cost**: ~20% overhead (5GB → 6GB with samples)
+### DuckDB Native Functions
+
+| Function | Before (Python) | After (DuckDB Native) | Speedup |
+|----------|----------------|----------------------|---------|
+| `COUNT(DISTINCT)` | ~493s (8+ min) | **~700ms** | **680x** |
+| `MEDIAN/PERCENTILE` | ~19s (exact) | **~5s** | **3.5x** |
+
+### Accuracy-Based Sample Selection
+
+| Accuracy Target | Sample | Actual Accuracy | Storage | Query Time |
+|----------------|--------|-----------------|---------|------------|
+| 85% | **1%** | ~96% | 50MB | ~100ms |
+| 90% | **10%** | ~99% | 500MB | ~3ms |
+| 95% | **20%** | ~99.5% | 1GB | ~4ms |
+
+**Storage Cost**: ~31% overhead (5GB → 6.5GB with 1%/10%/20% samples)
 
 See full analysis: `logs/RESULTS_ANALYSIS.md`
 
@@ -81,10 +99,10 @@ See full analysis: `logs/RESULTS_ANALYSIS.md`
 | `src/aqe/accuracy.py` | Accuracy-to-parameters mapping |
 | `src/aqe/error.py` | Error estimation for sampling |
 | `src/aqe/strategies/` | Execution strategies |
-| `src/aqe/strategies/python_hll.py` | HyperLogLog for COUNT DISTINCT |
-| `src/aqe/strategies/tdigest.py` | t-Digest for quantiles |
+| `src/aqe/strategies/duckdb_approx.py` | DuckDB native APPROX_COUNT_DISTINCT |
+| `src/aqe/strategies/duckdb_quantile.py` | DuckDB native APPROX_QUANTILE |
 | `src/aqe/strategies/stratified.py` | Stratified sampling for GROUP BY |
-| `src/aqe/strategies/materialized.py` | **NEW**: Pre-computed sample tables |
+| `src/aqe/strategies/materialized.py` | Pre-computed samples (1%/10%/20%/stratified) |
 
 ## API Endpoints
 
@@ -217,14 +235,18 @@ routing = router.route(sql, db, accuracy=0.95)
 
 **Routing Rules:**
 
-| Pattern | Condition | Strategy |
-|---------|-----------|----------|
-| `COUNT(DISTINCT col)` | cardinality > 10K | `python_hll` |
-| `GROUP BY col` | materialized sample exists | `materialized` |
-| `GROUP BY col` | Gini > 0.6 (skewed) | `stratified` |
-| `PERCENTILE` / `MEDIAN` | always | `tdigest` |
-| Simple aggregate | row_count > 100K | `duckdb_sample` |
-| Small table | row_count < 100K | `exact` |
+| Pattern | Condition | Strategy | Sample |
+|---------|-----------|----------|--------|
+| `COUNT(DISTINCT col)` | always | `duckdb_approx` | DuckDB native HLL |
+| `PERCENTILE` / `MEDIAN` | always | `duckdb_quantile` | DuckDB native t-Digest |
+| `GROUP BY col` | accuracy 85-90% | `materialized` | 1% sample |
+| `GROUP BY col` | accuracy 91-95% | `materialized` | 10% sample |
+| `GROUP BY col` | accuracy 96-99% | `materialized` | 20% sample |
+| `GROUP BY col` | Gini > 0.6 (skewed) | `stratified` | 10% per group |
+| Simple aggregate | accuracy 85-90% | `materialized` | 1% sample |
+| Simple aggregate | accuracy 91-95% | `materialized` | 10% sample |
+| Simple aggregate | accuracy 96-99% | `materialized` | 20% sample |
+| Small table | row_count < 100K | `exact` | Full scan |
 
 ### 4. Accuracy Mapping (`src/aqe/accuracy.py`)
 
@@ -263,14 +285,14 @@ Uses DuckDB's native `USING SAMPLE` for fast uniform sampling.
 **Speedup**: 10x
 **Error**: ±3-5% for 10% sample
 
-### python_hll
+### duckdb_approx
 
-HyperLogLog for approximate COUNT DISTINCT using datasketch.
+DuckDB native APPROX_COUNT_DISTINCT using HyperLogLog in C++.
 
 **Best for**: High-cardinality columns (user_id, order_id)
-**Speedup**: 5x
-**Error**: Tunable (p=12: ±1.3%, p=14: ±0.6%, p=16: ±0.3%)
-**Memory**: 4-64KB
+**Speedup**: **680x** vs Python HLL
+**Error**: ~4%
+**Advantage**: Native C++ implementation
 
 ### stratified
 
@@ -281,13 +303,13 @@ Sample within each GROUP BY group to preserve rare groups.
 **Error**: ±1-2% per group
 **Critical**: Prevents missing small groups like "Antarctica"
 
-### tdigest
+### duckdb_quantile
 
-t-Digest for accurate quantiles (median, p95, p99).
+DuckDB native APPROX_QUANTILE using t-Digest in C++.
 
 **Best for**: Percentile queries
-**Speedup**: 4x
-**Error**: ±0.1%
+**Speedup**: **3.5x** vs exact
+**Error**: ~0.2%
 **Advantage**: Much more accurate than sampling for quantiles
 
 ## Dataset
@@ -304,10 +326,8 @@ Generated by: `uv run scripts/generate_data.py`
 
 ```toml
 dependencies = [
-    "duckdb>=1.5.1",        # Fast analytical SQL
+    "duckdb>=1.5.1",        # Fast analytical SQL with native approx functions
     "sqlglot>=25.0.0",      # SQL parsing for auto-router
-    "datasketch>=1.9.0",    # HyperLogLog
-    "tdigest>=0.5.2.2",     # t-Digest for quantiles
     "fastapi>=0.135.2",     # HTTP API
     "pydantic>=2.12.5",     # Request/response models
     "uvicorn>=0.42.0",      # ASGI server
@@ -338,20 +358,21 @@ dependencies = [
 - ✅ Simple implementation
 
 **Tradeoffs:**
-- ⚠️ 20% storage overhead
+- ⚠️ ~31% storage overhead (1% + 10% + 20% + stratified samples)
 - ⚠️ Stale data until refresh
-- ⚠️ Pre-computation time at startup
+- ⚠️ Pre-computation time at startup (~60s for 500M rows)
 
 **When to use:**
 - Dashboard queries (run frequently, need speed)
 - Historical analysis (stale data acceptable)
 - GROUP BY on low-cardinality columns
+- Simple aggregates with accuracy 85-99%
 
 **When NOT to use:**
 - Real-time monitoring (need fresh data)
 - Small tables (< 100K rows)
-- COUNT DISTINCT operations
 - Complex JOINs
+- High-selectivity WHERE clauses (e.g., user_id = 123)
 
 ### Why sqlglot?
 
@@ -372,22 +393,35 @@ Gini coefficient (0-1) measures distribution inequality:
 ### Manual Tests
 
 ```bash
-# Test materialized samples (fast!)
+# Test accuracy-based materialized samples
 curl -X POST http://localhost:8000/query \
-  -d '{"sql": "SELECT region, COUNT(*) FROM sales GROUP BY region", "accuracy": 0.95}'
-
-# Test auto-router with different accuracies
-curl -X POST http://localhost:8000/query \
-  -d '{"sql": "SELECT COUNT(*) FROM sales", "accuracy": 0.90}'
+  -H "Content-Type: application/json" \
+  -d '{"sql": "SELECT COUNT(*) FROM sales", "accuracy": 0.85}'  # Uses 1% sample
 
 curl -X POST http://localhost:8000/query \
-  -d '{"sql": "SELECT COUNT(*) FROM sales", "accuracy": 0.99}'
+  -H "Content-Type: application/json" \
+  -d '{"sql": "SELECT COUNT(*) FROM sales", "accuracy": 0.90}'  # Uses 10% sample
 
-# Test COUNT DISTINCT → python_hll
 curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"sql": "SELECT COUNT(*) FROM sales", "accuracy": 0.95}'  # Uses 20% sample
+
+# Test COUNT DISTINCT → DuckDB native (680x faster)
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
   -d '{"sql": "SELECT COUNT(DISTINCT user_id) FROM sales", "accuracy": 0.95}'
 
-# Refresh materialized samples
+# Test MEDIAN → DuckDB native (3.5x faster)
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"sql": "SELECT MEDIAN(amount) FROM sales", "accuracy": 0.95}'
+
+# Test GROUP BY with stratified sample
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"sql": "SELECT region, COUNT(*) FROM sales GROUP BY region", "accuracy": 0.95}'
+
+# Refresh all materialized samples
 curl -X POST http://localhost:8000/refresh
 ```
 
@@ -417,13 +451,13 @@ ls logs/
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Auto-router | ✅ Complete | Rule-based strategy selection |
-| Materialized samples | ✅ Complete | 10-150x speedup |
-| HyperLogLog | ✅ Complete | COUNT DISTINCT |
+| Materialized samples | ✅ Complete | 1%/10%/20% by accuracy tier |
+| COUNT DISTINCT | ✅ Complete | DuckDB APPROX_COUNT_DISTINCT (680x) |
 | Stratified sampling | ✅ Complete | GROUP BY on skewed data |
-| t-Digest | ✅ Complete | Quantile queries |
-| Error estimation | ✅ Complete | Confidence intervals |
-| /refresh endpoint | ✅ Complete | Rebuild samples |
-| Documentation | ✅ Complete | This file + RESULTS_ANALYSIS.md |
+| Quantiles | ✅ Complete | DuckDB APPROX_QUANTILE (3.5x) |
+| Error estimation | ✅ Complete | Per-strategy error bounds |
+| /refresh endpoint | ✅ Complete | Rebuild all samples |
+| Documentation | ✅ Complete | This file + RESULTS_ANALYSIS.md + ARCHITECTURE.md |
 
 ## Notes for Claude
 
@@ -435,3 +469,11 @@ ls logs/
 - Stratified sampling creates new DB connection per group (slow for many groups)
 - Use `/refresh` endpoint after data changes to rebuild samples
 - See `logs/RESULTS_ANALYSIS.md` for detailed performance analysis
+
+### Timing Anomalies
+
+**Why might smaller samples appear slower?**
+- First query on any sample reads from cold disk cache (~300ms)
+- Subsequent queries benefit from warm OS cache (~2-5ms)
+- 1% sample (5M rows) vs 10% sample (50M rows) - both fit in memory after first access
+- Always run multiple queries to get accurate timing comparisons

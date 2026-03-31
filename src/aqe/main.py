@@ -7,8 +7,8 @@ from fastapi import FastAPI
 
 from aqe.models import QueryRequest, QueryResponse, QueryMetadata
 from aqe.error import estimate_count_error, estimate_sum_error, estimate_avg_error
-from aqe.strategies.python_hll import PythonHLLStrategy
-from aqe.strategies.tdigest import TDigestStrategy
+from aqe.strategies.duckdb_approx import DuckDBApproxStrategy
+from aqe.strategies.duckdb_quantile import DuckDBQuantileStrategy
 from aqe.strategies.stratified import StratifiedSamplingStrategy
 from aqe.profiler import DataProfiler
 from aqe.router import AutoRouter
@@ -103,14 +103,13 @@ async def query(req: QueryRequest):
     # Approximate mode - choose strategy
     strategy = req.strategy or "duckdb_sample"
 
-    if strategy == "python_hll":
-        hll = PythonHLLStrategy()
-        if not hll.supports(req.sql):
-            return {"error": "python_hll strategy requires COUNT(DISTINCT column)"}
+    if strategy == "duckdb_approx":
+        approx = DuckDBApproxStrategy()
+        if not approx.supports(req.sql):
+            return {"error": "duckdb_approx strategy requires COUNT(DISTINCT column)"}
 
         config = req.config or {}
-        config.setdefault("sample_rate", req.sample_rate)
-        result = hll.execute(req.sql, config)
+        result = approx.execute(req.sql, config, db=db)
 
         # Calculate achieved accuracy from error percentage
         error_pct = result["metadata"]["estimated_error_pct"]
@@ -123,21 +122,20 @@ async def query(req: QueryRequest):
                 strategy=strategy,
                 query_time_ms=result["metadata"]["query_time_ms"],
                 rows_returned=len(result["results"]),
-                sample_rate=result["metadata"].get("sample_rate"),
+                sample_rate=None,
                 error_estimate={"approx_count_distinct": result["metadata"]["estimated_error_pct"]},
                 accuracy_requested=req.accuracy,
                 accuracy_achieved=round(achieved, 3),
             ),
         )
 
-    elif strategy == "tdigest":
-        td = TDigestStrategy()
-        if not td.supports(req.sql):
-            return {"error": "tdigest strategy requires percentile/median query"}
+    elif strategy == "duckdb_quantile":
+        dq = DuckDBQuantileStrategy()
+        if not dq.supports(req.sql):
+            return {"error": "duckdb_quantile strategy requires percentile/median query"}
 
         config = req.config or {}
-        config.setdefault("sample_rate", req.sample_rate)
-        result = td.execute(req.sql, config)
+        result = dq.execute(req.sql, config, db=db)
 
         # Calculate achieved accuracy from error percentage
         error_pct = result["metadata"]["estimated_error_pct"]
@@ -150,7 +148,7 @@ async def query(req: QueryRequest):
                 strategy=strategy,
                 query_time_ms=result["metadata"]["query_time_ms"],
                 rows_returned=len(result["results"]),
-                sample_rate=result["metadata"].get("sample_rate"),
+                sample_rate=None,
                 error_estimate={"quantiles": result["metadata"]["estimated_error_pct"]},
                 accuracy_requested=req.accuracy,
                 accuracy_achieved=round(achieved, 3),
@@ -189,8 +187,9 @@ async def query(req: QueryRequest):
     elif strategy == "materialized":
         from aqe.strategies.materialized import MaterializedSampleStrategy
 
-        config = req.config or {}
-        sample_table = config.get("sample_table", "sales_sample_10pct")
+        # Use config from router (has sample_table), fallback to req.config
+        effective_config = {**(req.config or {}), **config}
+        sample_table = effective_config.get("sample_table", "sales_sample_10pct")
         ms = MaterializedSampleStrategy(sample_table)
 
         if not ms.supports(req.sql):
@@ -339,7 +338,7 @@ async def compare_strategies(req: QueryRequest):
     strategies = []
 
     # Test each strategy
-    for strategy_name in ["duckdb_sample", "stratified", "python_hll", "tdigest"]:
+    for strategy_name in ["duckdb_sample", "stratified", "duckdb_approx", "duckdb_quantile", "materialized"]:
         try:
             test_req = QueryRequest(
                 sql=req.sql,
@@ -399,8 +398,8 @@ async def refresh_samples():
     dropped = []
     created = []
 
-    # Drop existing samples
-    for sample_name in ["sales_sample_10pct", "sales_sample_stratified"]:
+    # Drop existing samples (all types)
+    for sample_name in ["sales_sample_1pct", "sales_sample_10pct", "sales_sample_20pct", "sales_sample_stratified"]:
         try:
             db.execute(f"DROP TABLE IF EXISTS {sample_name}")
             dropped.append(sample_name)
