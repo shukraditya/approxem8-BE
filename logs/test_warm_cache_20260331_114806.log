@@ -1,0 +1,61 @@
+=== Warm Cache Performance Tests ===
+Date: $(date)
+Dataset: 500M rows, ~5GB
+
+--- Accuracy-Based Sample Selection ---
+
+1% Sample (85% accuracy target):
+  Run 1: 1.78ms, count=4962304
+  Run 2: 0.85ms, count=4962304
+  Run 3: 0.79ms, count=4962304
+  Average: ~1.1ms
+
+10% Sample (90% accuracy target):
+  Run 1: 2.12ms, count=50118656
+  Run 2: 2.64ms, count=50118656
+  Run 3: 2.24ms, count=50118656
+  Average: ~2.3ms
+
+20% Sample (95% accuracy target):
+  Run 1: 3.4ms, count=99741696
+  Run 2: 3.48ms, count=99741696
+  Run 3: 3.56ms, count=99741696
+  Average: ~3.5ms
+
+--- GROUP BY with Stratified Sample ---
+
+GROUP BY region (90% accuracy):
+  Run 1: 186.5ms
+  Run 2: 156.33ms
+  Run 3: 149.46ms
+  Average: ~164ms
+
+--- DuckDB Native Functions ---
+
+COUNT DISTINCT (APPROX_COUNT_DISTINCT):
+  Run 1: 948.83ms, distinct=962761
+  Run 2: 1154.47ms, distinct=962761
+  Run 3: 812.55ms, distinct=962761
+  Average: ~972ms (vs ~493s Python HLL = 508x faster)
+
+MEDIAN (APPROX_QUANTILE):
+  Run 1: 7296.63ms, median=500.0
+  Run 2: 5966.39ms, median=500.0
+  Run 3: 7397.11ms, median=500.0
+  Average: ~6.9s (vs ~23s exact = 3.3x faster)
+
+--- Exact Queries (for comparison) ---
+
+Exact COUNT(*):
+  Run 1: 20.42ms
+  Run 2: 21.4ms
+  Run 3: 20.01ms
+
+Exact COUNT(DISTINCT):
+  Run 1: 15497.47ms
+  Run 2: 11783.4ms
+  Run 3: 10688.8ms
+
+Exact MEDIAN:
+  Run 1: 23576.23ms
+  Run 2: 26167.75ms
