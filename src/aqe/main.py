@@ -21,6 +21,15 @@ _db = None
 _profiler = None
 _router = None
 
+# Profiling status for progress tracking
+_profiling_status = {
+    "is_profiling": False,
+    "table": None,
+    "started_at": None,
+    "progress": 0,  # 0-100
+    "message": "",
+}
+
 
 def get_db():
     """Get or create DuckDB connection with sales data loaded."""
@@ -34,12 +43,25 @@ def get_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage database connection lifecycle."""
-    global _profiler, _router
+    global _profiler, _router, _profiling_status
     db = get_db()  # Initialize on startup
 
-    # Initialize profiler and profile tables
+    # Initialize profiler and profile tables with progress tracking
     _profiler = DataProfiler()
-    _profiler.profile_table(db, "sales")
+
+    def update_progress(progress, message):
+        _profiling_status["is_profiling"] = True
+        _profiling_status["table"] = "sales"
+        _profiling_status["progress"] = progress
+        _profiling_status["message"] = message
+        print(f"Profiling: {progress}% - {message}")
+
+    _profiling_status["is_profiling"] = True
+    _profiling_status["started_at"] = time.time()
+    _profiler.profile_table(db, "sales", progress_callback=update_progress)
+    _profiling_status["is_profiling"] = False
+    _profiling_status["progress"] = 100
+    _profiling_status["message"] = "Complete"
 
     # Create materialized samples for fast querying
     _profiler.create_materialized_samples(db, "sales")
@@ -312,14 +334,19 @@ def add_sample_clause(sql: str, sample_rate: float) -> str:
 
 @app.post("/compare")
 async def compare(req: QueryRequest):
-    """Run exact and approximate queries, compare results."""
+    """Run exact and approximate queries, compare results.
+
+    Uses accuracy-based routing to select optimal strategy (materialized samples).
+    """
     # Run exact
     exact_req = QueryRequest(sql=req.sql, mode="exact")
     exact_result = await query(exact_req)
 
-    # Run approx
+    # Run approx with accuracy-based routing (triggers materialized samples)
+    # Default to 0.95 accuracy which selects 10% materialized sample
+    accuracy = req.accuracy or 0.95
     approx_req = QueryRequest(
-        sql=req.sql, mode="approx", sample_rate=req.sample_rate, strategy=req.strategy
+        sql=req.sql, mode="approx", accuracy=accuracy
     )
     approx_result = await query(approx_req)
 
@@ -335,6 +362,8 @@ async def compare(req: QueryRequest):
             "time_ms": approx_result.metadata.query_time_ms,
             "strategy": approx_result.metadata.strategy,
             "sample_rate": approx_result.metadata.sample_rate,
+            "accuracy_requested": approx_result.metadata.accuracy_requested,
+            "accuracy_achieved": approx_result.metadata.accuracy_achieved,
             "results": approx_result.results,
             "error_estimate": approx_result.metadata.error_estimate,
         },
@@ -342,24 +371,62 @@ async def compare(req: QueryRequest):
     }
 
 
+@app.get("/profiling-status")
+async def profiling_status():
+    """Get current profiling status for progress tracking."""
+    global _profiling_status
+    return {
+        "is_profiling": _profiling_status["is_profiling"],
+        "table": _profiling_status["table"],
+        "progress": _profiling_status["progress"],
+        "message": _profiling_status["message"],
+    }
+
+
 @app.post("/refresh")
 async def refresh():
-    """Refresh profiler cache and re-profile tables."""
-    global _profiler, _router
-    db = get_db()
+    """Refresh profiler cache and re-profile tables with progress tracking."""
+    import threading
+    global _profiler, _router, _profiling_status
 
-    # Clear cache
-    if _profiler:
-        _profiler.cache.clear()
+    def do_refresh():
+        db = get_db()
 
-    # Re-profile
-    profile = _profiler.profile_table(db, "sales")
+        def update_progress(progress, message):
+            _profiling_status["is_profiling"] = True
+            _profiling_status["table"] = "sales"
+            _profiling_status["progress"] = progress
+            _profiling_status["message"] = message
+            print(f"Profiling: {progress}% - {message}")
+
+        # Clear cache
+        if _profiler:
+            _profiler.invalidate_cache("sales")
+
+        # Re-profile with progress
+        _profiling_status["started_at"] = time.time()
+        profile = _profiler.profile_table(db, "sales", progress_callback=update_progress)
+
+        # Recreate materialized samples
+        _profiler.create_materialized_samples(db, "sales")
+
+        # Update router
+        global _router
+        _router = AutoRouter(_profiler)
+
+        _profiling_status["is_profiling"] = False
+        _profiling_status["progress"] = 100
+        _profiling_status["message"] = "Complete"
+
+    # Start profiling in background thread
+    if not _profiling_status["is_profiling"]:
+        thread = threading.Thread(target=do_refresh)
+        thread.start()
 
     return {
-        "status": "ok",
-        "message": "Profiler cache refreshed",
+        "status": "started",
+        "message": "Profiling started",
         "table": "sales",
-        "row_count": profile.get("row_count"),
     }
 
 

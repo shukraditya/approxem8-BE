@@ -64,12 +64,13 @@ class DataProfiler:
         except Exception as e:
             print(f"Failed to save cache for {table_name}: {e}")
 
-    def profile_table(self, db, table_name: str) -> Dict[str, Any]:
+    def profile_table(self, db, table_name: str, progress_callback=None) -> Dict[str, Any]:
         """Profile a table: row count, column stats, skew.
 
         Args:
             db: DuckDB connection
             table_name: Name of table to profile
+            progress_callback: Optional callback function(progress_pct, message)
 
         Returns:
             Dictionary with row_count and column statistics
@@ -86,17 +87,27 @@ class DataProfiler:
 
         # Profile the table
         print(f"Profiling {table_name}...")
+        if progress_callback:
+            progress_callback(5, "Counting rows...")
 
         # Count total rows
         row_count = db.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+
+        if progress_callback:
+            progress_callback(15, "Getting column info...")
 
         # Get column information
         columns = db.execute(f"DESCRIBE {table_name}").fetchall()
         col_stats = {}
 
-        for col_info in columns:
+        total_cols = len(columns)
+        for idx, col_info in enumerate(columns):
             col_name = col_info[0]
             col_type = col_info[1]
+
+            progress = 15 + int((idx / total_cols) * 80)
+            if progress_callback:
+                progress_callback(progress, f"Profiling column {idx+1}/{total_cols}: {col_name}")
 
             # Cardinality (distinct count)
             try:
@@ -146,6 +157,9 @@ class DataProfiler:
                     "cardinality": distinct,
                 }
 
+        if progress_callback:
+            progress_callback(95, "Saving results...")
+
         profile = {
             "row_count": row_count,
             "columns": col_stats,
@@ -154,6 +168,9 @@ class DataProfiler:
         # Cache in memory and on disk
         self.cache[table_name] = profile
         self._save_to_disk(table_name, profile)
+
+        if progress_callback:
+            progress_callback(100, "Complete!")
 
         return profile
 
