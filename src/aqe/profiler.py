@@ -1,6 +1,13 @@
 """Data profiling module for intelligent strategy selection."""
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from pathlib import Path
+import json
+import time
 import duckdb
+
+
+CACHE_DIR = Path(".cache")
+CACHE_TTL_SECONDS = 20 * 60  # 20 minutes
 
 
 class DataProfiler:
@@ -13,6 +20,49 @@ class DataProfiler:
     def __init__(self):
         self.cache: Dict[str, Dict[str, Any]] = {}
         self.materialized_samples: Dict[str, list] = {}
+        self._ensure_cache_dir()
+
+    def _ensure_cache_dir(self):
+        """Create cache directory if it doesn't exist."""
+        CACHE_DIR.mkdir(exist_ok=True)
+
+    def _get_cache_path(self, table_name: str) -> Path:
+        """Get the file path for a table's cached profile."""
+        return CACHE_DIR / f"{table_name}_profile.json"
+
+    def _load_from_disk(self, table_name: str) -> Optional[Dict[str, Any]]:
+        """Load cached profile from disk if it exists and is not expired."""
+        cache_path = self._get_cache_path(table_name)
+        if not cache_path.exists():
+            return None
+
+        try:
+            with open(cache_path, "r") as f:
+                cached = json.load(f)
+
+            # Check if expired (older than TTL)
+            cached_time = cached.get("_cached_at", 0)
+            if time.time() - cached_time > CACHE_TTL_SECONDS:
+                print(f"Cache expired for {table_name}, re-profiling...")
+                return None
+
+            print(f"Loaded cached profile for {table_name} (age: {int((time.time() - cached_time) / 60)}m)")
+            return cached.get("data")
+        except Exception as e:
+            print(f"Failed to load cache for {table_name}: {e}")
+            return None
+
+    def _save_to_disk(self, table_name: str, data: Dict[str, Any]):
+        """Save profile to disk cache."""
+        cache_path = self._get_cache_path(table_name)
+        try:
+            with open(cache_path, "w") as f:
+                json.dump({
+                    "_cached_at": time.time(),
+                    "data": data
+                }, f, indent=2, default=str)
+        except Exception as e:
+            print(f"Failed to save cache for {table_name}: {e}")
 
     def profile_table(self, db, table_name: str) -> Dict[str, Any]:
         """Profile a table: row count, column stats, skew.
@@ -24,9 +74,18 @@ class DataProfiler:
         Returns:
             Dictionary with row_count and column statistics
         """
-        # Return cached result if available
+        # Return in-memory cached result if available
         if table_name in self.cache:
             return self.cache[table_name]
+
+        # Try loading from disk cache
+        disk_cache = self._load_from_disk(table_name)
+        if disk_cache is not None:
+            self.cache[table_name] = disk_cache
+            return disk_cache
+
+        # Profile the table
+        print(f"Profiling {table_name}...")
 
         # Count total rows
         row_count = db.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
@@ -87,11 +146,29 @@ class DataProfiler:
                     "cardinality": distinct,
                 }
 
-        self.cache[table_name] = {
+        profile = {
             "row_count": row_count,
             "columns": col_stats,
         }
-        return self.cache[table_name]
+
+        # Cache in memory and on disk
+        self.cache[table_name] = profile
+        self._save_to_disk(table_name, profile)
+
+        return profile
+
+    def invalidate_cache(self, table_name: str):
+        """Invalidate cache for a table (both memory and disk)."""
+        if table_name in self.cache:
+            del self.cache[table_name]
+
+        cache_path = self._get_cache_path(table_name)
+        if cache_path.exists():
+            try:
+                cache_path.unlink()
+                print(f"Invalidated cache for {table_name}")
+            except Exception as e:
+                print(f"Failed to delete cache file: {e}")
 
     def _calculate_gini(self, histogram) -> float:
         """Calculate Gini coefficient from histogram (0=even, 1=skewed).
@@ -133,7 +210,9 @@ class DataProfiler:
         """Create materialized sample tables at startup.
 
         Creates:
+        - {table}_sample_1pct: 1% uniform sample
         - {table}_sample_10pct: 10% uniform sample
+        - {table}_sample_20pct: 20% uniform sample
         - {table}_sample_stratified: 10% per-region stratified sample
 
         Args:

@@ -1,12 +1,17 @@
 # AQE System Architecture
 
+## Overview
+
+Approximate Query Engine (AQE) - FastAPI service for fast analytical queries using materialized samples and DuckDB native approximate functions.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              FRONTEND (Your UI)                                  │
+│                              FRONTEND (React + Vite)                             │
 │  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────────────────┐  │
-│  │ SQL Editor  │    │ Accuracy    │    │ Results Table + Metadata Cards      │  │
-│  │             │    │ Slider      │    │ (strategy, latency, accuracy)       │  │
-│  │ SELECT ...  │    │ 80% ─── 99% │    │                                     │  │
+│  │ SQL Editor  │    │ Accuracy    │    │ Results + Compare View              │  │
+│  │             │    │ 3-Step      │    │ (exact vs approx, speedup)          │  │
+│  │ SELECT ...  │    │ Fast/Bal/   │    │                                     │  │
+│  │             │    │ Precise     │    │ Refresh button → /refresh           │  │
 │  └──────┬──────┘    └──────┬──────┘    └─────────────────────────────────────┘  │
 │         │                  │                                                    │
 │         └──────────────────┘                                                    │
@@ -24,7 +29,9 @@
 │  │  ├── DataProfiler.profile_table(db, "sales")                                ││
 │  │  │       └── Collect: row_count, cardinality, mean, stddev, gini           ││
 │  │  └── DataProfiler.create_materialized_samples(db, "sales")                ││
+│  │         ├── CREATE TABLE sales_sample_1pct  (1% uniform)                   ││
 │  │         ├── CREATE TABLE sales_sample_10pct (10% uniform)                  ││
+│  │         ├── CREATE TABLE sales_sample_20pct (20% uniform)                  ││
 │  │         └── CREATE TABLE sales_sample_stratified (10% per region)          ││
 │  └─────────────────────────────────────────────────────────────────────────────┘│
 │                                      │                                          │
@@ -33,34 +40,21 @@
 │  │ /query ENDPOINT                                                             ││
 │  │                                                                             ││
 │  │  Input: {sql: "SELECT region, COUNT(*) FROM sales GROUP BY region",        ││
-│  │          accuracy: 0.95}                                                   ││
+│  │          accuracy: 0.925}  ← 0.875=1%, 0.925=10%, 0.975=20%               ││
 │  │                                                                             ││
 │  │  Step 1: AUTO-ROUTER (src/aqe/router.py)                                   ││
 │  │          ├── Parse SQL (sqlglot) → table, columns, aggregations            ││
 │  │          ├── Check DataProfile → row_count, skew                           ││
-│  │          ├── Check has_materialized_sample? → YES                          ││
-│  │          └── Return: {strategy: "materialized",                            ││
-│  │                      config: {sample_table: "sales_sample_stratified"}}    ││
+│  │          ├── IF COUNT(DISTINCT) → duckdb_approx                            ││
+│  │          ├── IF PERCENTILE/MEDIAN → duckdb_quantile                        ││
+│  │          ├── IF GROUP BY + materialized exists → materialized              ││
+│  │          └── ELSE → duckdb_sample                                          ││
 │  │                                                                             ││
 │  │  Step 2: STRATEGY EXECUTION                                                ││
-│  │          └── MaterializedSampleStrategy.execute(sql, config, db)           ││
-│  │              ├── Rewrite: FROM sales → FROM sales_sample_stratified        ││
-│  │              ├── db.execute(modified_sql)                                  ││
-│  │              └── Return DataFrame                                          ││
+│  │          └── Route to strategy.execute(sql, config, db)                    ││
 │  │                                                                             ││
 │  │  Step 3: BUILD RESPONSE                                                    ││
-│  │          └── QueryResponse {                                               ││
-│  │              results: [{region: "US", cnt: 44695974}, ...],                 ││
-│  │              metadata: {                                                    ││
-│  │                mode: "approx",                                              ││
-│  │                strategy: "materialized",                                    ││
-│  │                query_time_ms: 122.36,                                       ││
-│  │                accuracy_requested: 0.95,                                    ││
-│  │                accuracy_achieved: 0.95,                                     ││
-│  │                error_estimate: {materialized: true,                         ││
-│  │                                sample_table: "sales_sample_stratified"}     ││
-│  │              }                                                              ││
-│  │          }                                                                  ││
+│  │          └── QueryResponse {results, metadata: {strategy, time, accuracy}} ││
 │  └─────────────────────────────────────────────────────────────────────────────┘│
 │                                      │                                          │
 │                                      ▼                                          │
@@ -74,138 +68,90 @@
 │  │ DUCKDB                                                                   │    │
 │  │                                                                          │    │
 │  │  ┌─────────────────────┐    ┌─────────────────────────────────────────┐ │    │
-│  │  │ sales.parquet       │    │ sales_sample_10pct                      │ │    │
-│  │  │ (500M rows, ~5GB)   │    │ (50M rows, ~500MB)                      │ │    │
-│  │  │                     │    │ Uniform random sample                   │ │    │
-│  │  │ user_id: BIGINT     │    │                                         │ │    │
-│  │  │ region: VARCHAR     │    │ ┌─────────────────────────────────┐     │ │    │
-│  │  │ amount: DECIMAL     │    │ │ sales_sample_stratified         │     │ │    │
-│  │  │ date: TIMESTAMP     │    │ │ (50M rows, ~500MB)              │     │ │    │
-│  │  │                     │    │ │                                 │     │ │    │
-│  │  │                     │    │ │ 10% from US (45M rows)         │     │ │    │
-│  │  │                     │    │ │ 10% from UK (4M rows)          │     │ │    │
-│  │  │                     │    │ │ 10% from Antarctica (1M rows)  │     │ │    │
-│  │  │                     │    │ │                                 │     │ │    │
-│  │  │                     │    │ │ Balanced for GROUP BY region    │     │ │    │
-│  │  │                     │    │ └─────────────────────────────────┘     │ │    │
+│  │  │ sales.parquet       │    │ Materialized Samples (31% overhead)     │ │    │
+│  │  │ (500M rows, ~5GB)   │    │                                         │ │    │
+│  │  │                     │    │ sales_sample_1pct   (5M rows, ~50MB)   │ │    │
+│  │  │ user_id: BIGINT     │    │ sales_sample_10pct  (50M rows, ~500MB) │ │    │
+│  │  │ region: VARCHAR     │    │ sales_sample_20pct  (100M rows, ~1GB)  │ │    │
+│  │  │ amount: DECIMAL     │    │ sales_sample_stratified                │ │    │
+│  │  │ date: TIMESTAMP     │    │   (10% per region, balanced)           │ │    │
+│  │  │                     │    │                                         │ │    │
 │  │  └─────────────────────┘    └─────────────────────────────────────────┘ │    │
 │  └─────────────────────────────────────────────────────────────────────────┘    │
 │                                                                                  │
 │  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │ IN-MEMORY CACHE (DataProfiler)                                           │    │
+│  │ CACHE LAYER (DataProfiler)                                               │    │
 │  │                                                                          │    │
-│  │  cache = {                                                               │    │
-│  │    "sales": {                                                            │    │
-│  │      row_count: 500000000,                                               │    │
-│  │      columns: {                                                          │    │
-│  │        region: {type: "VARCHAR", cardinality: 3, gini: 0.6},             │    │
-│  │        amount: {type: "DECIMAL", cardinality: 500M,                      │    │
-│  │                  mean: 250, stddev: 500, gini: 0.3}                      │    │
-│  │      }                                                                   │    │
-│  │    }                                                                     │    │
-│  │  }                                                                       │    │
+│  │  IN-MEMORY: cache = {"sales": {row_count, columns, ...}}                 │    │
+│  │  ON-DISK:   .cache/sales_profile.json (TTL: 20 min)                      │    │
 │  │                                                                          │    │
-│  │  materialized_samples = {                                                │    │
-│  │    "sales": ["10pct", "stratified"]                                      │    │
-│  │  }                                                                       │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐     │    │
+│  │  │ Cache Strategy                                                  │     │    │
+│  │  │ 1. Check in-memory → return if hit                              │     │    │
+│  │  │ 2. Check disk cache → load if not expired (20 min TTL)          │     │    │
+│  │  │ 3. Profile table → save to disk + memory                        │     │    │
+│  │  │                                                                 │     │    │
+│  │  │ INVALIDATION: POST /refresh OR auto-expire after 20 min         │     │    │
+│  │  └─────────────────────────────────────────────────────────────────┘     │    │
 │  └─────────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           STRATEGY HIERARCHY                                     │
-│                                                                                  │
-│  ROUTER DECISION TREE (priority order):                                          │
-│                                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐│
-│  │ 0. MATERIALIZED ───────────────────────────────────────────────────────────││
-│  │    IF: GROUP BY + materialized sample exists                                 ││
-│  │    THEN: Use pre-computed table (10-150x faster)                            ││
-│  │    PROS: Instant, exact results                                             ││
-│  │    CONS: 20% storage overhead, stale data                                   ││
-│  │                                                                             ││
-│  │ 1. TDIGEST ─────────────────────────────────────────────────────────────────││
-│  │    IF: PERCENTILE / MEDIAN queries                                          ││
-│  │    THEN: t-Digest algorithm                                                 ││
-│  │    PROS: Accurate quantiles                                                 ││
-│  │    CONS: High memory usage                                                  ││
-│  │                                                                             ││
-│  │ 2. PYTHON_HLL ──────────────────────────────────────────────────────────────││
-│  │    IF: COUNT(DISTINCT column)                                               ││
-│  │    THEN: HyperLogLog (datasketch)                                           ││
-│  │    PROS: 4-64KB memory regardless of data size                              ││
-│  │    CONS: ~1% error, slow in Python (8+ min for 500M rows)                   ││
-│  │                                                                             ││
-│  │ 3. STRATIFIED ──────────────────────────────────────────────────────────────││
-│  │    IF: GROUP BY + Gini > 0.6 (skewed data)                                  ││
-│  │    THEN: Sample within each group                                           ││
-│  │    PROS: Preserves rare groups (Antarctica)                                 ││
-│  │    CONS: Slower than uniform sampling                                       ││
-│  │                                                                             ││
-│  │ 4. DUCKDB_SAMPLE ───────────────────────────────────────────────────────────││
-│  │    IF: Simple aggregates or fallback                                        ││
-│  │    THEN: DuckDB USING SAMPLE clause                                         ││
-│  │    PROS: Fast native implementation                                         ││
-│  │    CONS: Runtime sampling overhead                                          ││
-│  │                                                                             ││
-│  │ 5. EXACT ───────────────────────────────────────────────────────────────────││
-│  │    IF: accuracy not specified OR table < 100K rows                          ││
-│  │    THEN: Full table scan                                                    ││
-│  │    PROS: 100% accurate                                                      ││
-│  │    CONS: Slow for large tables                                              ││
-│  └─────────────────────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           FILE STRUCTURE                                         │
-│                                                                                  │
-│  src/aqe/                                                                        │
-│  ├── main.py              # FastAPI app, endpoints, query orchestration         │
-│  ├── models.py            # Pydantic: QueryRequest, QueryResponse, Metadata     │
-│  ├── profiler.py          # DataProfiler: table stats + materialized samples    │
-│  ├── router.py            # AutoRouter: strategy selection logic                │
-│  ├── accuracy.py          # accuracy_to_sample_rate, accuracy_to_hll_precision  │
-│  ├── error.py             # Error estimation functions                          │
-│  └── strategies/                                                                 │
-│       ├── __init__.py     # ExecutionStrategy base class                        │
-│       ├── materialized.py # MaterializedSampleStrategy                          │
-│       ├── python_hll.py   # HyperLogLog for COUNT DISTINCT                      │
-│       ├── stratified.py   # Stratified sampling for GROUP BY                    │
-│       └── tdigest.py      # t-Digest for quantiles                              │
-│                                                                                  │
-│  logs/                                                                           │
-│  └── RESULTS_ANALYSIS.md  # Performance benchmarks                              │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           API ENDPOINTS                                          │
-│                                                                                  │
-│  GET    /health           → {status: "ok", data_loaded: true}                    │
-│  POST   /query            → Execute SQL with auto-routing                        │
-│  POST   /compare          → Compare exact vs approximate with speedup            │
-│  POST   /compare-strategies → Benchmark all strategies                           │
-│  POST   /refresh          → Rebuild materialized samples                         │
-│                                                                                  │
-│  Request:  {sql: string, accuracy?: 0.80-0.99, mode?: "exact"|"approx"}          │
-│  Response: {results: [{}], metadata: {mode, strategy, query_time_ms, ...}}       │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Data Flow Summary
+## API Endpoints
+
+| Endpoint | Method | Description | Request | Response |
+|----------|--------|-------------|---------|----------|
+| `/health` | GET | Health check | - | `{status, data_loaded}` |
+| `/query` | POST | Execute query with auto-routing | `{sql, accuracy?, mode?}` | `{results, metadata}` |
+| `/compare` | POST | Exact vs approx with speedup | `{sql, sample_rate?}` | `{exact, approx, speedup}` |
+| `/compare-strategies` | POST | Benchmark all strategies | `{sql, sample_rate?}` | `{exact, strategies[]}` |
+| `/refresh` | POST | Invalidate cache + rebuild samples | - | `{status, dropped[], created[]}` |
+
+## Strategy Routing
 
 ```
 User Query
     ↓
-[Router] Parse SQL → Check Profile → Pick Strategy
-    ↓
-[Strategy] Execute on appropriate data source
-    ↓
-[Response] Results + Metadata (latency, accuracy, strategy used)
+IF COUNT(DISTINCT col) → duckdb_approx (DuckDB APPROX_COUNT_DISTINCT)
+IF PERCENTILE/MEDIAN → duckdb_quantile (DuckDB APPROX_QUANTILE)
+IF accuracy ≥ 0.95 + has 20pct → materialized (sales_sample_20pct)
+IF accuracy ≥ 0.90 + has 10pct → materialized (sales_sample_10pct)
+IF accuracy ≥ 0.85 + has 1pct → materialized (sales_sample_1pct)
+IF GROUP BY + stratified exists → materialized (sales_sample_stratified)
+ELSE → duckdb_sample (runtime sampling)
 ```
 
-## Key Design Decisions
+## File Structure
 
-1. **Materialized samples preferred**: Pre-computed tables are 10-150x faster
-2. **Accuracy-based API**: Users specify target (0.80-0.99), system picks implementation
-3. **Automatic fallback**: If materialized doesn't support query, falls back to runtime sampling
-4. **Profile caching**: Table stats computed once at startup, reused for all queries
-5. **Pluggable strategies**: New algorithms can be added without changing router logic
+```
+src/aqe/
+├── main.py              # FastAPI app, endpoints, CORS
+├── models.py            # Pydantic: QueryRequest, QueryResponse
+├── profiler.py          # DataProfiler: stats + materialized samples
+├── router.py            # AutoRouter: strategy selection
+├── accuracy.py          # Accuracy → sample rate mapping
+├── error.py             # Error estimation
+└── strategies/
+     ├── __init__.py
+     ├── materialized.py    # Pre-computed sample tables
+     ├── duckdb_approx.py   # APPROX_COUNT_DISTINCT
+     ├── duckdb_quantile.py # APPROX_QUANTILE
+     └── stratified.py      # Per-group sampling
+```
+
+## Performance Characteristics
+
+| Strategy | Speedup | Error | Use Case |
+|----------|---------|-------|----------|
+| materialized | 10-150x | 0% | GROUP BY, simple aggregates |
+| duckdb_approx | 680x | ~4% | COUNT DISTINCT |
+| duckdb_quantile | 3.5x | ~0.2% | MEDIAN, percentiles |
+| duckdb_sample | 10x | ~5% | Fallback |
+
+## Accuracy Tiers
+
+| Accuracy Target | Sample Used | Storage | Query Time |
+|-----------------|-------------|---------|------------|
+| 85-90% (Fast) | 1% (5M rows) | 50MB | ~1ms |
+| 90-95% (Balanced) | 10% (50M rows) | 500MB | ~3ms |
+| 96-99% (Precise) | 20% (100M rows) | 1GB | ~5ms |

@@ -406,10 +406,11 @@ async def refresh_samples():
         except Exception as e:
             print(f"Warning: Could not drop {sample_name}: {e}")
 
-    # Clear profiler's materialized sample tracking
+    # Clear profiler's materialized sample tracking AND file cache
     global _profiler
     if _profiler:
         _profiler.materialized_samples = {}
+        _profiler.invalidate_cache("sales")
 
     # Recreate samples
     if _profiler:
