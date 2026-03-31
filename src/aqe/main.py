@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 import duckdb
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from aqe.models import QueryRequest, QueryResponse, QueryMetadata
 from aqe.error import estimate_count_error, estimate_sum_error, estimate_avg_error
@@ -54,6 +55,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Approximate Query Engine", lifespan=lifespan)
+
+# CORS for frontend dev server
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://localhost:8080"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
@@ -329,6 +339,27 @@ async def compare(req: QueryRequest):
             "error_estimate": approx_result.metadata.error_estimate,
         },
         "speedup": round(speedup, 2),
+    }
+
+
+@app.post("/refresh")
+async def refresh():
+    """Refresh profiler cache and re-profile tables."""
+    global _profiler, _router
+    db = get_db()
+
+    # Clear cache
+    if _profiler:
+        _profiler.cache.clear()
+
+    # Re-profile
+    profile = _profiler.profile_table(db, "sales")
+
+    return {
+        "status": "ok",
+        "message": "Profiler cache refreshed",
+        "table": "sales",
+        "row_count": profile.get("row_count"),
     }
 
 
