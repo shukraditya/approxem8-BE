@@ -147,7 +147,7 @@ async def query(req: QueryRequest):
         error_pct = result["metadata"]["estimated_error_pct"]
         achieved = 1.0 - (error_pct / 100)
 
-        return QueryResponse(
+        response = QueryResponse(
             results=result["results"],
             metadata=QueryMetadata(
                 mode=req.mode,
@@ -160,6 +160,9 @@ async def query(req: QueryRequest):
                 accuracy_achieved=round(achieved, 3),
             ),
         )
+        if cache_key:
+            _cache_result(cache_key, response)
+        return response
 
     elif strategy == "duckdb_quantile":
         dq = DuckDBQuantileStrategy()
